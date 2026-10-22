@@ -1,0 +1,5 @@
+/target/
+# what ci/archive.sh stages and writes, and the CLI ci/cli.sh fetches
+/pkg/
+/out/
+/cli/

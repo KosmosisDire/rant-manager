@@ -1,0 +1,103 @@
+# Builds and tests the manager on every platform the rant CLI ships for, and packs the archive
+# rant install unpacks. A pushed tag v<version> also cuts a GitHub Release with the archives.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Linux builds in the manylinux_2_28 container, as Rant's wheels do, so the manager runs on
+  # any glibc since 2.28. No linux-arm64, since the CLI it drives ships no build for it.
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  platform: linux-x64, container: 'quay.io/pypa/manylinux_2_28_x86_64' }
+          - { os: windows-latest, platform: win-x64 }
+          - { os: macos-15,       platform: osx-arm64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The tag matches the crate's version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # the end to end tests drive the newest released CLI, as users run it
+      - name: The newest rant
+        shell: bash
+        run: |
+          sh ci/cli.sh ${{ matrix.platform }}
+          echo "RANT_CLI=$GITHUB_WORKSPACE/cli/rant${{ runner.os == 'Windows' && '.exe' || '' }}" >> "$GITHUB_ENV"
+
+      - name: Lint
+        run: cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --release
+
+      - name: Build
+        run: cargo build --locked --release --bins
+
+      - name: Archive
+        shell: bash
+        run: sh ci/archive.sh ${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rant-manager-${{ matrix.platform }}
+          path: out/*
+
+  # The Linux manager must start on the oldest and newest distributions people run.
+  check-linux:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: rant-manager-linux-x64
+          path: out
+
+      - name: The archive holds the package
+        run: |
+          mkdir pkg
+          tar -xzf out/rant-manager-*-linux-x64.tar.gz -C pkg
+          test -f pkg/package.rant && test -f pkg/Manager.run
+
+      - name: It starts everywhere
+        run: |
+          for image in rockylinux:8 debian:10 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04; do
+            echo "== $image"
+            docker run --rm -v "$PWD/pkg:/p" "$image" /p/bin/rant-manager --version
+          done
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, check-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rant-manager-*
+          path: release
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release/*
+          generate_release_notes: true

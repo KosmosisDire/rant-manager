@@ -1,0 +1,6 @@
+description = "Runs, stops and restarts this workspace's groups and nodes from the mesh"
+restart     = "on-failure"
+
+node "manager/manager" {
+  args = "--workspace \"${path.workspace}\""
+}

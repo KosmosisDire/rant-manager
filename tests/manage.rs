@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rant::types::Empty;
 use rant::{CallOptions, FunctionOptions, Node, NodeOptions, RemoteFunction, VariableOptions};
-use rant_manager::{Action, GroupState, NodeState, RunningStatus};
+use rant_manager::{Action, GroupState, ManageRequest, Name, NodeState, RunningStatus};
 
 /// Set on every rant command the test runs, so the nodes those start inherit it.
 const SLEEPER: &str = "MANAGER_TEST_SLEEPER";
@@ -37,7 +37,8 @@ struct Workspace {
 }
 
 impl Workspace {
-    /// A workspace folder `cell` on domain with two sleepers in group io/Ft, and the manager.
+    /// A workspace folder `cell` on domain with two sleepers in group io/Ft, the group Line
+    /// that includes it, and the manager.
     fn new(test: &str, domain: u16) -> Workspace {
         let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -51,6 +52,7 @@ impl Workspace {
                 format!("node \"sleeper\" {{\n  run = \"{sleeper}\"\n  expect_mesh = false\n}}\nnode \"napper\" {{\n  run = \"{sleeper}\"\n  expect_mesh = false\n}}\n"),
             ),
             ("io/Ft.run", "description = \"Two sleepers\"\nnode \"io/sleeper\" {}\nnode \"io/napper\" {}\n".into()),
+            ("Line.run", "include \"io/Ft\" {}\n".into()),
             // the manager joins on loopback, where rant run would never see it come up
             ("manager/package.rant", format!("node \"manager\" {{\n  run = \"{manager}\"\n  expect_mesh = false\n}}\n")),
             ("manager/Manager.run", std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Manager.run")).unwrap()),
@@ -105,16 +107,20 @@ fn tester(domain: u16) -> Node {
     Node::new("tester", NodeOptions::new().domain(domain).multicast_interface("127.0.0.1")).unwrap()
 }
 
-fn manage(node: &Node, path: &str) -> RemoteFunction<Action, Empty> {
+fn manage(node: &Node, path: &str) -> RemoteFunction<ManageRequest, Empty> {
     // a call ends at its handle's timeout, whatever wait the call itself asks for
-    let f = node.remote_function::<Action, Empty>(path, FunctionOptions::new().timeout(Duration::from_secs(30))).unwrap();
+    let f = node.remote_function::<ManageRequest, Empty>(path, FunctionOptions::new().timeout(Duration::from_secs(30))).unwrap();
     wait_for(path, || f.match_count() > 0);
     f
 }
 
-fn call(f: &RemoteFunction<Action, Empty>, action: Action) -> Result<(), String> {
-    let r = f.call(&action, CallOptions::new()).unwrap();
+fn call(f: &RemoteFunction<ManageRequest, Empty>, name: &str, action: Action) -> Result<(), String> {
+    let r = f.call(&ManageRequest { name: name.try_into().unwrap(), action }, CallOptions::new()).unwrap();
     if r.is_ok() { Ok(()) } else { Err(r.message().to_string()) }
+}
+
+fn names(list: &[Name]) -> Vec<&str> {
+    list.iter().map(|n| n.name.as_str()).filter(|n| !n.is_empty()).collect()
 }
 
 #[test]
@@ -125,46 +131,53 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
 
     // the prefix is the workspace folder's name, as no placement sets one
     let groups = node.remote_variable::<Vec<GroupState>>("Cell/Rant/Groups", VariableOptions::new()).unwrap();
-    wait_for("the group list", || groups.get().unwrap().is_some_and(|l| l.len() == 2));
-    let ft = groups.get().unwrap().unwrap().into_iter().find(|g| g.name == "io/Ft").unwrap();
-    assert_eq!(ft.manage_path, "Cell/Rant/Groups/Io/Ft/Manage");
+    let nodes = node.remote_variable::<Vec<NodeState>>("Cell/Rant/Nodes", VariableOptions::new()).unwrap();
+    wait_for("the group list", || groups.get().unwrap().is_some_and(|l| l.len() == 3));
+    wait_for("the node list", || nodes.get().unwrap().is_some_and(|l| l.len() == 3));
+    let group = |name: &str| groups.get().unwrap().unwrap().into_iter().find(|g| g.name == name).unwrap();
+    let sleeper = || nodes.get().unwrap().unwrap().into_iter().find(|n| n.name == "io/sleeper").unwrap();
+
+    let ft = group("io/Ft");
     assert_eq!(ft.description, "Two sleepers");
     assert_eq!(ft.status, RunningStatus::Stopped);
+    assert_eq!((names(&ft.nodes), names(&ft.groups)), (vec!["io/sleeper", "io/napper"], vec![]));
+    let line = group("Line");
+    assert_eq!((names(&line.nodes), names(&line.groups)), (vec![], vec!["io/Ft"]));
+    assert_eq!(names(&sleeper().groups), ["io/Ft"]);
 
-    let group = node.remote_variable::<GroupState>("Cell/Rant/Groups/Io/Ft", VariableOptions::new()).unwrap();
-    let sleeper = node.remote_variable::<NodeState>("Cell/Rant/Nodes/Io/Sleeper", VariableOptions::new()).unwrap();
-    let group_is = |s| group.get().unwrap().is_some_and(|g| g.status == s);
-    let sleeper_is = |s| sleeper.get().unwrap().is_some_and(|n| n.status == s);
+    let group_is = |s| group("io/Ft").status == s;
+    let sleeper_is = |s| sleeper().status == s;
 
-    let ft = manage(&node, "Cell/Rant/Groups/Io/Ft/Manage");
-    call(&ft, Action::Run).unwrap();
+    let groups_manage = manage(&node, "Cell/Rant/Groups/Manage");
+    call(&groups_manage, "io/Ft", Action::Run).unwrap();
     wait_for("io/Ft running", || group_is(RunningStatus::Running) && sleeper_is(RunningStatus::Running));
     assert_eq!(ws.running(), ["manager", "napper", "sleeper"]);
 
-    let one = manage(&node, "Cell/Rant/Nodes/Io/Sleeper/Manage");
-    call(&one, Action::Restart).unwrap();
+    let nodes_manage = manage(&node, "Cell/Rant/Nodes/Manage");
+    call(&nodes_manage, "io/sleeper", Action::Restart).unwrap();
     let log = ws.root.join("logs/sleeper.log.1");
     assert!(log.is_file(), "a restart starts a new log and keeps the last");
     assert!(sleeper_is(RunningStatus::Running));
 
-    call(&one, Action::Stop).unwrap();
+    call(&nodes_manage, "io/sleeper", Action::Stop).unwrap();
     wait_for("io/sleeper stopped", || sleeper_is(RunningStatus::Stopped));
     assert!(group_is(RunningStatus::Running), "io/Ft still holds napper");
     assert_eq!(ws.running(), ["manager", "napper"]);
 
-    call(&ft, Action::Stop).unwrap();
+    call(&groups_manage, "io/Ft", Action::Stop).unwrap();
     wait_for("io/Ft stopped", || group_is(RunningStatus::Stopped));
-    let again = call(&ft, Action::Stop).unwrap_err();
+    let again = call(&groups_manage, "io/Ft", Action::Stop).unwrap_err();
     assert!(again.contains("not running"), "{again}");
 
     // a node run alone stays outside the group
-    call(&one, Action::Run).unwrap();
+    call(&nodes_manage, "io/sleeper", Action::Run).unwrap();
     wait_for("io/sleeper alone", || sleeper_is(RunningStatus::Running));
     assert!(group_is(RunningStatus::Stopped));
-    call(&one, Action::Stop).unwrap();
+    call(&nodes_manage, "io/sleeper", Action::Stop).unwrap();
 
-    let me = manage(&node, "Cell/Rant/Groups/Manager/Manager/Manage");
-    let refused = call(&me, Action::Restart).unwrap_err();
+    let unknown = call(&groups_manage, "io/Nope", Action::Run).unwrap_err();
+    assert!(unknown.contains("no group `io/Nope`"), "{unknown}");
+    let refused = call(&groups_manage, "manager/Manager", Action::Restart).unwrap_err();
     assert!(refused.contains("holds the manager itself"), "{refused}");
     assert_eq!(ws.running(), ["manager"]);
 }
@@ -174,7 +187,7 @@ fn stopping_the_manager_leaves_the_nodes_it_started() {
     let ws = Workspace::new("stop", 181);
     ws.rant(&["run", "Manager", "--no-build", "-y"]).unwrap();
     let node = tester(181);
-    call(&manage(&node, "Cell/Rant/Groups/Io/Ft/Manage"), Action::Run).unwrap();
+    call(&manage(&node, "Cell/Rant/Groups/Manage"), "io/Ft", Action::Run).unwrap();
     assert_eq!(ws.running(), ["manager", "napper", "sleeper"]);
     ws.rant(&["stop", "Manager", "-y"]).unwrap();
     assert_eq!(ws.running(), ["napper", "sleeper"]);

@@ -8,4 +8,4 @@ mod names;
 mod types;
 
 pub use manager::{Manager, Options};
-pub use types::{Action, GroupState, NodeState, RunningStatus};
+pub use types::{Action, GroupState, MEMBERS, ManageRequest, Name, NodeState, RunningStatus};

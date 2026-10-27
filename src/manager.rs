@@ -1,7 +1,6 @@
-//! The node: one variable and one Manage function per group and per node, the two lists, and
-//! the loop that keeps them in step with the CLI and runs each Manage call.
+//! The node: the group and node lists, a Manage function beside each, and the loop that keeps
+//! the lists in step with the CLI and runs each Manage call.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -12,7 +11,7 @@ use rant::{Deferred, FunctionDefinition, FunctionOptions, Level, Node, NodeOptio
 use crate::cli::Cli;
 use crate::listing::{self, Listing};
 use crate::names;
-use crate::types::{Action, GroupState, NodeState, RunningStatus};
+use crate::types::{Action, GroupState, MEMBERS, ManageRequest, Name, NodeState, RunningStatus};
 
 /// How often the CLI is asked what runs, so changes made elsewhere show.
 const POLL: Duration = Duration::from_secs(2);
@@ -29,16 +28,18 @@ enum Kind {
     Node,
 }
 
+impl Kind {
+    fn word(self) -> &'static str {
+        match self {
+            Kind::Group => "group",
+            Kind::Node => "node",
+        }
+    }
+}
+
 enum Event {
     Manage { kind: Kind, name: String, action: Action, answer: Deferred<Empty> },
     Quit,
-}
-
-/// A group or node as the CLI lists it.
-struct Item {
-    name: String,
-    description: String,
-    running: bool,
 }
 
 fn status(running: bool) -> RunningStatus {
@@ -54,86 +55,68 @@ fn cut(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-fn group_state(i: &Item, manage_path: &str) -> Result<GroupState, rant::Error> {
-    Ok(GroupState {
-        name: i.name.as_str().try_into()?,
-        manage_path: manage_path.try_into()?,
-        description: cut(&i.description, 128).try_into()?,
-        status: status(i.running),
+/// A row's name, or none with the name in skipped when it does not fit.
+fn row_name(name: &str, skipped: &mut Vec<String>) -> Option<rant::String<64>> {
+    let fits = name.try_into().ok();
+    if fits.is_none() {
+        skipped.push(format!("{name} (over 64 bytes)"));
+    }
+    fits
+}
+
+/// A row's fixed list of names. Those past its end are named in skipped, and a name too long
+/// for a row of its own is left out, as its row is.
+fn members(owner: &str, what: &str, names: &[String], skipped: &mut Vec<String>) -> [Name; MEMBERS] {
+    let fit: Vec<Name> = names.iter().filter_map(|n| Some(Name { name: n.as_str().try_into().ok()? })).collect();
+    if fit.len() > MEMBERS {
+        skipped.push(format!("the {what} of {owner} past the first {MEMBERS}"));
+    }
+    let mut out = [Name::default(); MEMBERS];
+    out.iter_mut().zip(fit).for_each(|(slot, n)| *slot = n);
+    out
+}
+
+fn group_state(g: &listing::Group, skipped: &mut Vec<String>) -> Option<GroupState> {
+    Some(GroupState {
+        name: row_name(&g.name, skipped)?,
+        description: cut(&g.description, 128).try_into().ok()?,
+        status: status(!g.copies.is_empty()),
+        nodes: members(&g.name, "nodes", &g.nodes, skipped),
+        groups: members(&g.name, "groups", &g.groups, skipped),
     })
 }
 
-fn node_state(i: &Item, manage_path: &str) -> Result<NodeState, rant::Error> {
-    Ok(NodeState { name: i.name.as_str().try_into()?, manage_path: manage_path.try_into()?, status: status(i.running) })
+fn node_state(n: &listing::Node, skipped: &mut Vec<String>) -> Option<NodeState> {
+    Some(NodeState { name: row_name(&n.name, skipped)?, status: status(!n.copies.is_empty()), groups: members(&n.name, "groups", &n.groups, skipped) })
 }
 
-struct Entry<T: rant::Message> {
-    state: T,
-    var: VariableDefinition<T>,
-    _manage: FunctionDefinition<Action, Empty>,
-}
-
-/// One kind's entities: an entry per group or node, and the list of all of them.
-struct Table<T: rant::Message> {
-    kind: Kind,
-    root: &'static str,
-    make: fn(&Item, &str) -> Result<T, rant::Error>,
-    entries: BTreeMap<String, Entry<T>>,
-    list: VariableDefinition<Vec<T>>,
+/// A list variable, set only when its rows change.
+struct List<T: rant::Message> {
+    var: VariableDefinition<Vec<T>>,
     shown: Vec<T>,
 }
 
-impl<T: rant::Message + Clone + PartialEq> Table<T> {
-    fn new(node: &Node, kind: Kind, root: &'static str, make: fn(&Item, &str) -> Result<T, rant::Error>) -> Result<Self, rant::Error> {
-        let list = node.variable_definition(root, VariableOptions::new().read_only(true).initial(Vec::new()))?;
-        Ok(Table { kind, root, make, entries: BTreeMap::new(), list, shown: Vec::new() })
+impl<T: rant::Message + PartialEq> List<T> {
+    fn new(node: &Node, path: &str) -> Result<Self, rant::Error> {
+        let var = node.variable_definition(path, VariableOptions::new().read_only(true).initial(Vec::new()))?;
+        Ok(List { var, shown: Vec::new() })
     }
 
-    /// Makes, updates and drops entries to match items. One that cannot be offered goes into
-    /// skipped with the reason.
-    fn sync(&mut self, node: &Node, events: &Sender<Event>, prefix: &str, items: &[Item], skipped: &mut Vec<String>) {
-        let mut paths: BTreeMap<String, &str> = BTreeMap::new();
-        let mut list = Vec::new();
-        for i in items {
-            let path = names::entity(self.root, &i.name);
-            if let Some(first) = paths.get(&path) {
-                skipped.push(format!("{} (the same path as {first})", i.name));
-                continue;
-            }
-            paths.insert(path.clone(), &i.name);
-            match self.offer(node, events, prefix, i, &path) {
-                Ok(state) => list.push(state),
-                Err(why) => skipped.push(format!("{} ({why})", i.name)),
-            }
-        }
-        self.entries.retain(|name, _| paths.values().any(|n| n == name));
-        if list != self.shown {
-            let _ = self.list.set(&list);
-            self.shown = list;
+    fn show(&mut self, rows: Vec<T>) {
+        if rows != self.shown {
+            let _ = self.var.set(&rows);
+            self.shown = rows;
         }
     }
+}
 
-    /// Sets the entry's variable when its state changed, or makes its variable and function.
-    fn offer(&mut self, node: &Node, events: &Sender<Event>, prefix: &str, item: &Item, path: &str) -> Result<T, String> {
-        let manage = format!("{path}/Manage");
-        let state = (self.make)(item, &names::full(prefix, &manage)).map_err(|e| e.to_string())?;
-        if let Some(e) = self.entries.get_mut(&item.name) {
-            if e.state != state {
-                e.var.set(&state).map_err(|e| e.to_string())?;
-                e.state = state.clone();
-            }
-            return Ok(state);
-        }
-        let var = node.variable_definition(path, VariableOptions::new().read_only(true).initial(state.clone())).map_err(|e| e.to_string())?;
-        let (events, kind, name) = (events.clone(), self.kind, item.name.clone());
-        let handler = move |req: Request<Action, Empty>| {
-            let action = *req;
-            let _ = events.send(Event::Manage { kind, name: name.clone(), action, answer: req.defer() });
-        };
-        let manage = node.function_definition(&manage, FunctionOptions::new(), handler).map_err(|e| e.to_string())?;
-        self.entries.insert(item.name.clone(), Entry { state: state.clone(), var, _manage: manage });
-        Ok(state)
-    }
+fn manage_function(node: &Node, path: &str, kind: Kind, events: &Sender<Event>) -> Result<FunctionDefinition<ManageRequest, Empty>, rant::Error> {
+    let events = events.clone();
+    let handler = move |req: Request<ManageRequest, Empty>| {
+        let (name, action) = (req.name.to_string(), req.action);
+        let _ = events.send(Event::Manage { kind, name, action, answer: req.defer() });
+    };
+    node.function_definition(path, FunctionOptions::new(), handler)
 }
 
 pub struct Manager {
@@ -148,8 +131,9 @@ pub struct Manager {
     listing: Listing,
     /// Why the CLI last failed to list, so a lasting failure is logged once.
     failure: Option<String>,
-    groups: Table<GroupState>,
-    nodes: Table<NodeState>,
+    groups: List<GroupState>,
+    nodes: List<NodeState>,
+    _manage: [FunctionDefinition<ManageRequest, Empty>; 2],
 }
 
 impl Manager {
@@ -167,10 +151,11 @@ impl Manager {
             opts = opts.multicast_interface(ip.as_str());
         }
         let node = Node::new("manager", opts)?;
-        let groups = Table::new(&node, Kind::Group, "Rant/Groups", group_state)?;
-        let nodes = Table::new(&node, Kind::Node, "Rant/Nodes", node_state)?;
         let (events, inbox) = mpsc::channel();
         Ok(Manager {
+            groups: List::new(&node, "Rant/Groups")?,
+            nodes: List::new(&node, "Rant/Nodes")?,
+            _manage: [manage_function(&node, "Rant/Groups/Manage", Kind::Group, &events)?, manage_function(&node, "Rant/Nodes/Manage", Kind::Node, &events)?],
             node,
             cli: Cli { exe: o.rant, workspace: o.workspace },
             prefix: own.unwrap_or(placed),
@@ -179,8 +164,6 @@ impl Manager {
             inbox,
             listing: Listing::default(),
             failure: None,
-            groups,
-            nodes,
         })
     }
 
@@ -200,16 +183,16 @@ impl Manager {
             match self.inbox.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Event::Manage { kind, name, action, answer }) => {
                     let done = self.manage(kind, &name, action);
-                    // the variables show the outcome before the caller hears it
+                    // the lists show the outcome before the caller hears it
                     self.refresh();
                     next = Instant::now() + POLL;
                     let _ = match done {
                         Ok(()) => {
-                            println!("{action:?} {name}");
+                            println!("{action:?} {} {name}", kind.word());
                             answer.complete(&Empty {})
                         }
                         Err(why) => {
-                            println!("{action:?} {name} failed: {why}");
+                            println!("{action:?} {} {name} failed: {why}", kind.word());
                             answer.fail(&why)
                         }
                     };
@@ -234,7 +217,9 @@ impl Manager {
             Kind::Group => self.listing.groups.iter().find(|g| g.name == name).map(|g| g.copies.clone()),
             Kind::Node => self.listing.nodes.iter().find(|n| n.name == name).map(|n| n.copies.clone()),
         };
-        let copies = copies.unwrap_or_default();
+        let Some(copies) = copies else {
+            return Err(format!("no {} `{name}`, see `rant ls {}s`", kind.word(), kind.word()));
+        };
         // its answer would never arrive, and a stop would end it for good
         if action != Action::Run && copies.contains(&self.me) {
             return Err(format!("the manager cannot stop or restart `{name}`, which holds the manager itself"));
@@ -251,7 +236,7 @@ impl Manager {
         }
     }
 
-    /// Asks the CLI what there is and brings every entity in line with it.
+    /// Asks the CLI what there is and brings both lists in line with it.
     fn refresh(&mut self) {
         let read = self
             .cli
@@ -274,17 +259,11 @@ impl Manager {
                 return;
             }
         }
-        let groups: Vec<Item> = self
-            .listing
-            .groups
-            .iter()
-            .map(|g| Item { name: g.name.clone(), description: g.description.clone(), running: !g.copies.is_empty() })
-            .collect();
-        let nodes: Vec<Item> =
-            self.listing.nodes.iter().map(|n| Item { name: n.name.clone(), description: String::new(), running: !n.copies.is_empty() }).collect();
         let mut skipped = Vec::new();
-        self.groups.sync(&self.node, &self.events, &self.prefix, &groups, &mut skipped);
-        self.nodes.sync(&self.node, &self.events, &self.prefix, &nodes, &mut skipped);
+        let groups = self.listing.groups.iter().filter_map(|g| group_state(g, &mut skipped)).collect();
+        let nodes = self.listing.nodes.iter().filter_map(|n| node_state(n, &mut skipped)).collect();
+        self.groups.show(groups);
+        self.nodes.show(nodes);
         if skipped.is_empty() {
             let _ = self.node.clear_status("skipped");
         } else {

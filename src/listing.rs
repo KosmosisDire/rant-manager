@@ -10,6 +10,10 @@ use serde::Deserialize;
 pub struct Group {
     pub name: String,
     pub description: String,
+    /// The nodes its own file declares, by the names the CLI takes.
+    pub nodes: Vec<String>,
+    /// The groups it includes.
+    pub groups: Vec<String>,
     /// The mesh names of the running nodes it holds, its own runs' and those its blocks made.
     pub copies: Vec<String>,
 }
@@ -17,6 +21,8 @@ pub struct Group {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub name: String,
+    /// The groups whose own files declare it.
+    pub groups: Vec<String>,
     /// The mesh names of its running copies, which rant stop and restart take.
     pub copies: Vec<String>,
 }
@@ -37,6 +43,9 @@ pub struct Listing {
 struct GroupJson {
     name: String,
     description: String,
+    includes: Vec<String>,
+    /// Its own nodes, none while a param has no default.
+    nodes: Vec<CopyJson>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +84,10 @@ fn node_name(node_type: &str) -> String {
     }
 }
 
+fn node(by_node: &mut BTreeMap<String, Node>, name: String) -> &mut Node {
+    by_node.entry(name.clone()).or_insert_with(|| Node { name, groups: Vec::new(), copies: Vec::new() })
+}
+
 pub fn parse(groups_json: &str, nodes_json: &str) -> Result<Listing, String> {
     let groups: Vec<GroupJson> = serde_json::from_str(groups_json).map_err(|e| format!("rant ls groups: {e}"))?;
     let nodes: NodesJson = serde_json::from_str(nodes_json).map_err(|e| format!("rant ls nodes: {e}"))?;
@@ -94,21 +107,28 @@ pub fn parse(groups_json: &str, nodes_json: &str) -> Result<Listing, String> {
     }
 
     // a node two runs share shows under both
-    let mut by_node: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut by_node: BTreeMap<String, Node> = BTreeMap::new();
     for c in copies.iter().filter(|c| !c.node_type.is_empty()) {
-        add(by_node.entry(node_name(&c.node_type)).or_default(), &c.name);
+        add(&mut node(&mut by_node, node_name(&c.node_type)).copies, &c.name);
     }
     for idle in &nodes.not_running {
-        by_node.entry(idle.name.clone()).or_default();
+        node(&mut by_node, idle.name.clone());
     }
 
-    Ok(Listing {
-        groups: groups
-            .into_iter()
-            .map(|g| Group { copies: by_group.get(g.name.as_str()).cloned().unwrap_or_default(), name: g.name, description: g.description })
-            .collect(),
-        nodes: by_node.into_iter().map(|(name, copies)| Node { name, copies }).collect(),
-    })
+    let mut out = Vec::new();
+    for g in groups {
+        let mut own = Vec::new();
+        for n in &g.nodes {
+            let name = node_name(&n.node_type);
+            add(&mut node(&mut by_node, name.clone()).groups, &g.name);
+            add(&mut own, &name);
+        }
+        let mut includes = Vec::new();
+        g.includes.iter().for_each(|i| add(&mut includes, i));
+        let copies = by_group.get(g.name.as_str()).cloned().unwrap_or_default();
+        out.push(Group { name: g.name, description: g.description, nodes: own, groups: includes, copies });
+    }
+    Ok(Listing { groups: out, nodes: by_node.into_values().collect() })
 }
 
 #[cfg(test)]
@@ -117,7 +137,9 @@ mod tests {
 
     const GROUPS: &str = r#"[
         { "name": "Top", "file": "/w/Top.run", "description": "Top level", "params": "", "includes": ["io/Ft"], "nodes": [] },
-        { "name": "io/Ft", "file": "/w/io/Ft.run", "description": "Two sleepers", "params": "", "includes": [], "nodes": [] },
+        { "name": "io/Ft", "file": "/w/io/Ft.run", "description": "Two sleepers", "params": "", "includes": [], "nodes": [
+            { "name": "sleeper", "type": "io/sleeper" }, { "name": "other_waiter", "type": "io/waiter" }
+        ] },
         { "name": "io/Idle", "file": "/w/io/Idle.run", "description": "", "params": "", "includes": [], "nodes": [] }
     ]"#;
 
@@ -140,11 +162,23 @@ mod tests {
         assert_eq!(
             l.nodes,
             [
-                Node { name: "io/napper".into(), copies: vec![] },
-                Node { name: "io/sleeper".into(), copies: vec!["sleeper".into()] },
-                Node { name: "io/waiter".into(), copies: vec!["other_waiter".into()] },
+                Node { name: "io/napper".into(), groups: vec![], copies: vec![] },
+                Node { name: "io/sleeper".into(), groups: vec!["io/Ft".into()], copies: vec!["sleeper".into()] },
+                Node { name: "io/waiter".into(), groups: vec!["io/Ft".into()], copies: vec!["other_waiter".into()] },
             ]
         );
+    }
+
+    #[test]
+    fn a_group_lists_its_own_nodes_and_the_groups_it_includes() {
+        let nodes = r#"{ "domain": 0, "groups": [], "nodes": [], "not_running": [] }"#;
+        let l = parse(GROUPS, nodes).unwrap();
+        let top = &l.groups[0];
+        assert_eq!((top.nodes.clone(), top.groups.clone()), (vec![], vec!["io/Ft".to_string()]));
+        let ft = &l.groups[1];
+        assert_eq!((ft.nodes.clone(), ft.groups.clone()), (vec!["io/sleeper".to_string(), "io/waiter".to_string()], vec![]));
+        let declared: Vec<&str> = l.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(declared, ["io/sleeper", "io/waiter"]);
     }
 
     #[test]
@@ -163,8 +197,8 @@ mod tests {
         assert_eq!(
             l.nodes,
             [
-                Node { name: "arm/planner".into(), copies: vec!["left_planner".into(), "right_planner".into()] },
-                Node { name: "arm/solo".into(), copies: vec!["solo".into()] },
+                Node { name: "arm/planner".into(), groups: vec![], copies: vec!["left_planner".into(), "right_planner".into()] },
+                Node { name: "arm/solo".into(), groups: vec![], copies: vec!["solo".into()] },
             ]
         );
     }
@@ -174,6 +208,6 @@ mod tests {
         let file = if cfg!(windows) { "C:/w/tools/probe.py" } else { "/w/tools/probe.py" };
         let nodes = format!(r#"{{ "domain": 0, "groups": [], "nodes": [ {{ "name": "probe", "type": "{file}" }} ], "not_running": [] }}"#);
         let l = parse("[]", &nodes).unwrap();
-        assert_eq!(l.nodes, [Node { name: "probe".into(), copies: vec!["probe".into()] }]);
+        assert_eq!(l.nodes, [Node { name: "probe".into(), groups: vec![], copies: vec!["probe".into()] }]);
     }
 }

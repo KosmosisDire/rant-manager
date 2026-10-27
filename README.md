@@ -7,8 +7,8 @@ rant install manager
 rant run Manager
 ```
 
-Each group and node gets a state variable and a Manage function under `<Prefix>/Rant`, as
-[docs/mesh.md](docs/mesh.md) lays out.
+It offers a list of groups and a list of nodes under `<Prefix>/Rant`, each with a Manage
+function beside it, as [docs/mesh.md](docs/mesh.md) lays out.
 
 ## Build
 

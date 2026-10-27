@@ -1,6 +1,6 @@
 [package]
 name = "rant-manager"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "Runs, stops and restarts a workspace's groups and nodes from the mesh"
 publish = false

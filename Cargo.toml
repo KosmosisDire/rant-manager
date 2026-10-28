@@ -1,6 +1,6 @@
 [package]
 name = "rant-manager"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 description = "Runs, stops and restarts a workspace's groups and nodes from the mesh"
 publish = false
@@ -10,7 +10,7 @@ name = "rant-manager"
 path = "src/main.rs"
 
 [dependencies]
-rant-middleware = { git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.35" }
+rant-middleware = { git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.36" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 gethostname = "1"

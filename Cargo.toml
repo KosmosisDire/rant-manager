@@ -10,7 +10,7 @@ name = "rant-manager"
 path = "src/main.rs"
 
 [dependencies]
-rant-middleware = { git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.36" }
+rant-middleware = { git = "https://github.com/KosmosisDire/Rant.git", tag = "crate-v0.0.39" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 gethostname = "1"

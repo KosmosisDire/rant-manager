@@ -19,6 +19,7 @@ jobs:
     name: build ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +50,7 @@ jobs:
         run: cargo clippy --locked --release --all-targets -- -D warnings
 
       - name: Test
+        timeout-minutes: 10
         run: cargo test --locked --release
 
       - name: Build
@@ -67,6 +69,7 @@ jobs:
   check-linux:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -90,6 +93,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build, check-linux]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v8
         with:

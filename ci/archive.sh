@@ -1,11 +1,11 @@
 #!/bin/sh
 # Packs the release build as the archive rant install unpacks: package.rant, the group, and
 # bin/ with the manager.
-# Usage: ci/archive.sh <platform>, such as linux-x64. Writes out/rant-manager-<version>-<platform>.tar.gz
+# Usage: ci/archive.sh <platform>, such as linux-x64. Writes out/manager-<version>-<platform>.tar.gz
 set -e
 platform=$1
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-name="rant-manager-$version-$platform"
+name="manager-$version-$platform"
 rm -rf pkg && mkdir -p pkg/bin out
 for f in target/release/rant-manager target/release/rant-manager.exe; do
   if [ -f "$f" ]; then cp "$f" pkg/bin/; fi

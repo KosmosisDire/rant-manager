@@ -96,7 +96,7 @@ jobs:
       - name: The archive holds the package
         run: |
           mkdir pkg
-          tar -xzf out/rant-manager-*-linux-x64.tar.gz -C pkg
+          tar -xzf out/manager-*-linux-x64.tar.gz -C pkg
           test -f pkg/package.rant && test -f pkg/Manager.run
 
       - name: It starts everywhere
@@ -135,3 +135,4 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: release/*
           generate_release_notes: true
+          prerelease: ${{ contains(needs.plan.outputs.version, '-') }}

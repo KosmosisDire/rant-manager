@@ -1,6 +1,5 @@
 name        = "manager"
 description = "Runs, stops and restarts a workspace's groups and nodes from the mesh"
-archive     = "rant-manager-${version}-${platform}.tar.gz"
 
 node "manager" {
   run = "${path.package}/bin/rant-manager"

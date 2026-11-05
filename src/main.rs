@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use rant_manager::{Manager, Options};
 
-/// Offers each group and node of a workspace on the mesh, with a Manage function that runs,
+/// Offers each group and node of a workspace on the mesh, with a Manage task that runs,
 /// stops or restarts it through the rant command line tool.
 #[derive(Parser)]
 #[command(name = "rant-manager", version)]

@@ -1,17 +1,18 @@
-//! The node: the group and node lists, a Manage function beside each, and the loop that keeps
-//! the lists in step with the CLI and runs each Manage call.
+//! The node: the group and node lists, a Manage task beside each, and the loop that keeps the
+//! lists in step with the CLI and runs each Manage call.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use rant::types::Empty;
-use rant::{Deferred, FunctionDefinition, FunctionOptions, Level, Node, NodeOptions, Request, StatusOptions, VariableDefinition, VariableOptions};
+use rant::{Level, Node, NodeOptions, PendingTask, StatusOptions, TaskDefinition, TaskOptions, TaskRequest, VariableDefinition, VariableOptions};
 
 use crate::cli::Cli;
 use crate::listing::{self, Listing};
 use crate::names;
-use crate::types::{Action, GroupState, MEMBERS, ManageRequest, Name, NodeState, RunningStatus};
+use crate::progress::Progress;
+use crate::types::{Action, GroupState, ManageRequest, NodeProgress, NodeState, RunningStatus};
 
 /// How often the CLI is asked what runs, so changes made elsewhere show.
 const POLL: Duration = Duration::from_secs(2);
@@ -37,8 +38,11 @@ impl Kind {
     }
 }
 
+type Manage = TaskDefinition<ManageRequest, Vec<NodeProgress>, Empty>;
+type Pending = PendingTask<Vec<NodeProgress>, Empty>;
+
 enum Event {
-    Manage { kind: Kind, name: String, action: Action, answer: Deferred<Empty> },
+    Manage { kind: Kind, name: String, action: Action, task: Pending },
     Quit,
 }
 
@@ -46,48 +50,18 @@ fn status(running: bool) -> RunningStatus {
     if running { RunningStatus::Running } else { RunningStatus::Stopped }
 }
 
-/// The longest start of s that fits in max bytes, cut between characters.
-fn cut(s: &str, max: usize) -> &str {
-    let mut end = s.len().min(max);
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// A row's name, or none with the name in skipped when it does not fit.
-fn row_name(name: &str, skipped: &mut Vec<String>) -> Option<rant::String<64>> {
-    let fits = name.try_into().ok();
-    if fits.is_none() {
-        skipped.push(format!("{name} (over 64 bytes)"));
-    }
-    fits
-}
-
-/// A row's fixed list of names. Those past its end are named in skipped, and a name too long
-/// for a row of its own is left out, as its row is.
-fn members(owner: &str, what: &str, names: &[String], skipped: &mut Vec<String>) -> [Name; MEMBERS] {
-    let fit: Vec<Name> = names.iter().filter_map(|n| Some(Name { name: n.as_str().try_into().ok()? })).collect();
-    if fit.len() > MEMBERS {
-        skipped.push(format!("the {what} of {owner} past the first {MEMBERS}"));
-    }
-    let mut out = [Name::default(); MEMBERS];
-    out.iter_mut().zip(fit).for_each(|(slot, n)| *slot = n);
-    out
-}
-
-fn group_state(g: &listing::Group, skipped: &mut Vec<String>) -> Option<GroupState> {
-    Some(GroupState {
-        name: row_name(&g.name, skipped)?,
-        description: cut(&g.description, 128).try_into().ok()?,
+fn group_state(g: &listing::Group) -> GroupState {
+    GroupState {
+        name: g.name.clone(),
+        description: g.description.clone(),
         status: status(!g.copies.is_empty()),
-        nodes: members(&g.name, "nodes", &g.nodes, skipped),
-        groups: members(&g.name, "groups", &g.groups, skipped),
-    })
+        nodes: g.nodes.clone(),
+        groups: g.groups.clone(),
+    }
 }
 
-fn node_state(n: &listing::Node, skipped: &mut Vec<String>) -> Option<NodeState> {
-    Some(NodeState { name: row_name(&n.name, skipped)?, status: status(!n.copies.is_empty()), groups: members(&n.name, "groups", &n.groups, skipped) })
+fn node_state(n: &listing::Node) -> NodeState {
+    NodeState { name: n.name.clone(), status: status(!n.copies.is_empty()), groups: n.groups.clone() }
 }
 
 /// A list variable, set only when its rows change.
@@ -110,13 +84,14 @@ impl<T: rant::Message + PartialEq> List<T> {
     }
 }
 
-fn manage_function(node: &Node, path: &str, kind: Kind, events: &Sender<Event>) -> Result<FunctionDefinition<ManageRequest, Empty>, rant::Error> {
+fn manage_task(node: &Node, path: &str, kind: Kind, events: &Sender<Event>) -> Result<Manage, rant::Error> {
     let events = events.clone();
-    let handler = move |req: Request<ManageRequest, Empty>| {
-        let (name, action) = (req.name.to_string(), req.action);
-        let _ = events.send(Event::Manage { kind, name, action, answer: req.defer() });
+    let handler = move |req: TaskRequest<ManageRequest, Vec<NodeProgress>, Empty>| {
+        let (name, action) = (req.name.clone(), req.action);
+        let _ = events.send(Event::Manage { kind, name, action, task: req.defer() });
     };
-    node.function_definition(path, FunctionOptions::new(), handler)
+    // a CLI cut short could leave a node it started untracked
+    node.task_definition(path, TaskOptions::new().no_cancel(true), handler)
 }
 
 pub struct Manager {
@@ -133,7 +108,7 @@ pub struct Manager {
     failure: Option<String>,
     groups: List<GroupState>,
     nodes: List<NodeState>,
-    _manage: [FunctionDefinition<ManageRequest, Empty>; 2],
+    _manage: [Manage; 2],
 }
 
 impl Manager {
@@ -155,7 +130,7 @@ impl Manager {
         Ok(Manager {
             groups: List::new(&node, "Rant/Groups")?,
             nodes: List::new(&node, "Rant/Nodes")?,
-            _manage: [manage_function(&node, "Rant/Groups/Manage", Kind::Group, &events)?, manage_function(&node, "Rant/Nodes/Manage", Kind::Node, &events)?],
+            _manage: [manage_task(&node, "Rant/Groups/Manage", Kind::Group, &events)?, manage_task(&node, "Rant/Nodes/Manage", Kind::Node, &events)?],
             node,
             cli: Cli { exe: o.rant, workspace: o.workspace },
             prefix: own.unwrap_or(placed),
@@ -181,19 +156,19 @@ impl Manager {
         let mut next = Instant::now() + POLL;
         loop {
             match self.inbox.recv_timeout(next.saturating_duration_since(Instant::now())) {
-                Ok(Event::Manage { kind, name, action, answer }) => {
-                    let done = self.manage(kind, &name, action);
+                Ok(Event::Manage { kind, name, action, task }) => {
+                    let done = self.manage(kind, &name, action, &task);
                     // the lists show the outcome before the caller hears it
                     self.refresh();
                     next = Instant::now() + POLL;
                     let _ = match done {
                         Ok(()) => {
                             println!("{action:?} {} {name}", kind.word());
-                            answer.complete(&Empty {})
+                            task.complete(&Empty {})
                         }
                         Err(why) => {
                             println!("{action:?} {} {name} failed: {why}", kind.word());
-                            answer.fail(&why)
+                            task.fail(&why)
                         }
                     };
                 }
@@ -206,16 +181,10 @@ impl Manager {
         }
     }
 
-    fn manage(&mut self, kind: Kind, name: &str, action: Action) -> Result<(), String> {
-        let act = |target: &str| match action {
-            Action::Run if kind == Kind::Node => self.cli.run(&["run", "node", target, "--no-build", "-y"]),
-            Action::Run => self.cli.run(&["run", target, "--no-build", "-y"]),
-            Action::Stop => self.cli.run(&["stop", target, "-y"]),
-            Action::Restart => self.cli.run(&["restart", target, "--no-build", "-y"]),
-        };
+    fn manage(&self, kind: Kind, name: &str, action: Action, task: &Pending) -> Result<(), String> {
         let copies = match kind {
-            Kind::Group => self.listing.groups.iter().find(|g| g.name == name).map(|g| g.copies.clone()),
-            Kind::Node => self.listing.nodes.iter().find(|n| n.name == name).map(|n| n.copies.clone()),
+            Kind::Group => self.listing.groups.iter().find(|g| g.name == name).map(|g| &g.copies),
+            Kind::Node => self.listing.nodes.iter().find(|n| n.name == name).map(|n| &n.copies),
         };
         let Some(copies) = copies else {
             return Err(format!("no {} `{name}`, see `rant ls {}s`", kind.word(), kind.word()));
@@ -224,15 +193,33 @@ impl Manager {
         if action != Action::Run && copies.contains(&self.me) {
             return Err(format!("the manager cannot stop or restart `{name}`, which holds the manager itself"));
         }
+        // each node's row goes to the caller as the CLI prints it, and a failed node says why
+        let mut progress = Progress::default();
+        let mut rant = |args: &[&str]| {
+            let args = [args, &["-y", "--json", "--lines"][..]].concat();
+            let done = self.cli.stream(&args, |line| match progress.take(line) {
+                Ok(()) => {
+                    let _ = task.progress(&progress.nodes);
+                }
+                Err(why) => eprintln!("{why}"),
+            });
+            done.map(|_| ()).map_err(|why| progress.failed().unwrap_or(why))
+        };
+        let mut act = |action: Action, target: &str| match action {
+            Action::Run if kind == Kind::Node => rant(&["run", "node", target, "--no-build"]),
+            Action::Run => rant(&["run", target, "--no-build"]),
+            Action::Stop => rant(&["stop", target]),
+            Action::Restart => rant(&["restart", target, "--no-build"]),
+        };
         if kind == Kind::Group || action == Action::Run {
-            return act(name).map(|_| ());
+            return act(action, name);
         }
         // stop and restart take a running copy by its mesh name, and a node may run as many
         match action {
             Action::Stop if copies.is_empty() => Err(format!("node `{name}` is not running, see `rant ls`")),
             // as rant restart starts a group that is not running
-            Action::Restart if copies.is_empty() => self.cli.run(&["run", "node", name, "--no-build", "-y"]).map(|_| ()),
-            _ => copies.iter().try_for_each(|c| act(c).map(|_| ())),
+            Action::Restart if copies.is_empty() => act(Action::Run, name),
+            _ => copies.iter().try_for_each(|c| act(action, c)),
         }
     }
 
@@ -259,16 +246,7 @@ impl Manager {
                 return;
             }
         }
-        let mut skipped = Vec::new();
-        let groups = self.listing.groups.iter().filter_map(|g| group_state(g, &mut skipped)).collect();
-        let nodes = self.listing.nodes.iter().filter_map(|n| node_state(n, &mut skipped)).collect();
-        self.groups.show(groups);
-        self.nodes.show(nodes);
-        if skipped.is_empty() {
-            let _ = self.node.clear_status("skipped");
-        } else {
-            let text = format!("cannot offer {}", skipped.join(", "));
-            let _ = self.node.set_status("skipped", Level::Warn, &text, StatusOptions::new());
-        }
+        self.groups.show(self.listing.groups.iter().map(group_state).collect());
+        self.nodes.show(self.listing.nodes.iter().map(node_state).collect());
     }
 }

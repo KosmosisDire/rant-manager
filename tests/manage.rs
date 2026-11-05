@@ -6,8 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rant::types::Empty;
-use rant::{CallOptions, FunctionOptions, Node, NodeOptions, RemoteFunction, VariableOptions};
-use rant_manager::{Action, GroupState, ManageRequest, Name, NodeState, RunningStatus};
+use rant::{CallOptions, Node, NodeOptions, RemoteTask, TaskOptions, VariableOptions};
+use rant_manager::{Action, GroupState, ManageRequest, NodeProgress, NodeState, ProgressStatus, RunningStatus};
 
 /// Set on every rant command the test runs, so the nodes those start inherit it.
 const SLEEPER: &str = "MANAGER_TEST_SLEEPER";
@@ -21,6 +21,11 @@ fn sleeper() {
         std::thread::sleep(Duration::from_secs(120));
     }
 }
+
+/// Not a test: the program of a node that exits at once.
+#[test]
+#[ignore]
+fn brief() {}
 
 fn rant_cli() -> PathBuf {
     std::env::var_os("RANT_CLI").map_or_else(|| "rant".into(), PathBuf::from)
@@ -38,18 +43,19 @@ struct Workspace {
 
 impl Workspace {
     /// A workspace folder `cell` on domain with two sleepers in group io/Ft, the group Line
-    /// that includes it, and the manager.
+    /// that includes it, a node outside every group that exits at once, and the manager.
     fn new(test: &str, domain: u16) -> Workspace {
         let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         let (root, home) = (scratch.join("cell"), scratch.join("home"));
-        let sleeper = format!("'{}' --exact sleeper --ignored --nocapture", slashed(&std::env::current_exe().unwrap()));
+        let test = |name: &str| format!("'{}' --exact {name} --ignored --nocapture", slashed(&std::env::current_exe().unwrap()));
+        let (sleeper, brief) = (test("sleeper"), test("brief"));
         let manager = format!("'{}' --interface 127.0.0.1 --rant '{}'", slashed(Path::new(env!("CARGO_BIN_EXE_rant-manager"))), slashed(&rant_cli()));
         let files = [
             ("workspace.rant", format!("domain = {domain}\n")),
             (
                 "io/package.rant",
-                format!("node \"sleeper\" {{\n  run = \"{sleeper}\"\n  expect_mesh = false\n}}\nnode \"napper\" {{\n  run = \"{sleeper}\"\n  expect_mesh = false\n}}\n"),
+                format!("node \"sleeper\" {{\n  run = \"{sleeper}\"\n  expect_mesh = false\n}}\nnode \"napper\" {{\n  run = \"{sleeper}\"\n  expect_mesh = false\n}}\nnode \"brief\" {{\n  run = \"{brief}\"\n  expect_mesh = false\n}}\n"),
             ),
             ("io/Ft.run", "description = \"Two sleepers\"\nnode \"io/sleeper\" {}\nnode \"io/napper\" {}\n".into()),
             ("Line.run", "include \"io/Ft\" {}\n".into()),
@@ -107,20 +113,23 @@ fn tester(domain: u16) -> Node {
     Node::new("tester", NodeOptions::new().domain(domain).multicast_interface("127.0.0.1")).unwrap()
 }
 
-fn manage(node: &Node, path: &str) -> RemoteFunction<ManageRequest, Empty> {
-    // a call ends at its handle's timeout, whatever wait the call itself asks for
-    let f = node.remote_function::<ManageRequest, Empty>(path, FunctionOptions::new().timeout(Duration::from_secs(30))).unwrap();
-    wait_for(path, || f.match_count() > 0);
-    f
+type Manage = RemoteTask<ManageRequest, Vec<NodeProgress>, Empty>;
+
+fn manage(node: &Node, path: &str) -> Manage {
+    let t = node.remote_task::<ManageRequest, Vec<NodeProgress>, Empty>(path, TaskOptions::new()).unwrap();
+    wait_for(path, || t.match_count() > 0);
+    t
 }
 
-fn call(f: &RemoteFunction<ManageRequest, Empty>, name: &str, action: Action) -> Result<(), String> {
-    let r = f.call(&ManageRequest { name: name.try_into().unwrap(), action }, CallOptions::new()).unwrap();
-    if r.is_ok() { Ok(()) } else { Err(r.message().to_string()) }
+/// Each progress update the call streamed, or why it failed.
+fn call(t: &Manage, name: &str, action: Action) -> Result<Vec<Vec<NodeProgress>>, String> {
+    let mut updates = Vec::new();
+    let r = t.call(&ManageRequest { name: name.into(), action }, CallOptions::new(), |p| updates.extend(p.into_value())).unwrap();
+    if r.is_ok() { Ok(updates) } else { Err(r.message().to_string()) }
 }
 
-fn names(list: &[Name]) -> Vec<&str> {
-    list.iter().map(|n| n.name.as_str()).filter(|n| !n.is_empty()).collect()
+fn statuses(update: &[NodeProgress]) -> Vec<(&str, ProgressStatus)> {
+    update.iter().map(|n| (n.name.as_str(), n.status)).collect()
 }
 
 #[test]
@@ -133,33 +142,49 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
     let groups = node.remote_variable::<Vec<GroupState>>("Cell/Rant/Groups", VariableOptions::new()).unwrap();
     let nodes = node.remote_variable::<Vec<NodeState>>("Cell/Rant/Nodes", VariableOptions::new()).unwrap();
     wait_for("the group list", || groups.get().unwrap().is_some_and(|l| l.len() == 3));
-    wait_for("the node list", || nodes.get().unwrap().is_some_and(|l| l.len() == 3));
+    wait_for("the node list", || nodes.get().unwrap().is_some_and(|l| l.len() == 4));
     let group = |name: &str| groups.get().unwrap().unwrap().into_iter().find(|g| g.name == name).unwrap();
     let sleeper = || nodes.get().unwrap().unwrap().into_iter().find(|n| n.name == "io/sleeper").unwrap();
 
     let ft = group("io/Ft");
     assert_eq!(ft.description, "Two sleepers");
     assert_eq!(ft.status, RunningStatus::Stopped);
-    assert_eq!((names(&ft.nodes), names(&ft.groups)), (vec!["io/sleeper", "io/napper"], vec![]));
+    assert_eq!((ft.nodes, ft.groups), (vec!["io/sleeper".to_string(), "io/napper".to_string()], vec![]));
     let line = group("Line");
-    assert_eq!((names(&line.nodes), names(&line.groups)), (vec![], vec!["io/Ft"]));
-    assert_eq!(names(&sleeper().groups), ["io/Ft"]);
+    assert_eq!((line.nodes, line.groups), (vec![], vec!["io/Ft".to_string()]));
+    assert_eq!(sleeper().groups, ["io/Ft"]);
 
     let group_is = |s| group("io/Ft").status == s;
     let sleeper_is = |s| sleeper().status == s;
 
+    use ProgressStatus::{Running, Starting, Stopped};
     let groups_manage = manage(&node, "Cell/Rant/Groups/Manage");
-    call(&groups_manage, "io/Ft", Action::Run).unwrap();
+    let updates = call(&groups_manage, "io/Ft", Action::Run).unwrap();
+    let shown: Vec<_> = updates.iter().map(|u| statuses(u)).collect();
+    assert_eq!(
+        shown,
+        [
+            vec![("sleeper", Starting)],
+            vec![("sleeper", Starting), ("napper", Starting)],
+            vec![("sleeper", Running), ("napper", Starting)],
+            vec![("sleeper", Running), ("napper", Running)],
+        ],
+        "each node as it starts and as it comes up"
+    );
+    assert_eq!(updates[3][0].note, "started");
     wait_for("io/Ft running", || group_is(RunningStatus::Running) && sleeper_is(RunningStatus::Running));
     assert_eq!(ws.running(), ["manager", "napper", "sleeper"]);
 
     let nodes_manage = manage(&node, "Cell/Rant/Nodes/Manage");
-    call(&nodes_manage, "io/sleeper", Action::Restart).unwrap();
+    let updates = call(&nodes_manage, "io/sleeper", Action::Restart).unwrap();
+    assert_eq!(statuses(updates.last().unwrap()), [("sleeper", Running)]);
+    assert_eq!(updates.last().unwrap()[0].note, "restarted");
     let log = ws.root.join("logs/sleeper.log.1");
     assert!(log.is_file(), "a restart starts a new log and keeps the last");
     assert!(sleeper_is(RunningStatus::Running));
 
-    call(&nodes_manage, "io/sleeper", Action::Stop).unwrap();
+    let updates = call(&nodes_manage, "io/sleeper", Action::Stop).unwrap();
+    assert_eq!(statuses(updates.last().unwrap()), [("sleeper", Stopped)]);
     wait_for("io/sleeper stopped", || sleeper_is(RunningStatus::Stopped));
     assert!(group_is(RunningStatus::Running), "io/Ft still holds napper");
     assert_eq!(ws.running(), ["manager", "napper"]);
@@ -174,6 +199,9 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
     wait_for("io/sleeper alone", || sleeper_is(RunningStatus::Running));
     assert!(group_is(RunningStatus::Stopped));
     call(&nodes_manage, "io/sleeper", Action::Stop).unwrap();
+
+    let failed = call(&nodes_manage, "io/brief", Action::Run).unwrap_err();
+    assert!(failed.starts_with("brief exited after"), "{failed}");
 
     let unknown = call(&groups_manage, "io/Nope", Action::Run).unwrap_err();
     assert!(unknown.contains("no group `io/Nope`"), "{unknown}");

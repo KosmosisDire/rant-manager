@@ -5,7 +5,8 @@ mod cli;
 mod listing;
 mod manager;
 mod names;
+mod progress;
 mod types;
 
 pub use manager::{Manager, Options};
-pub use types::{Action, GroupState, MEMBERS, ManageRequest, Name, NodeState, RunningStatus};
+pub use types::{Action, GroupState, ManageRequest, NodeProgress, NodeState, ProgressStatus, RunningStatus};

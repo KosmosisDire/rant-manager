@@ -8,7 +8,7 @@ rant run Manager
 ```
 
 It offers a list of groups and a list of nodes under `<Prefix>/Rant`, each with a Manage
-function beside it, as [docs/mesh.md](docs/mesh.md) lays out.
+task beside it that reports each node as it starts, as [docs/mesh.md](docs/mesh.md) lays out.
 
 ## Build
 

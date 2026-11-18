@@ -18,6 +18,8 @@ HMI can see which run and run, stop or restart them.
   `Cell`). `Cell/Rant/Groups` lists every group as `GroupState[]`, `Cell/Rant/Nodes` every
   node as `NodeState[]`, each row with its `name`, as the CLI takes it, and its `status`
   (Stopped, Running).
+- A group is Running only while it was started itself, never because a group including it
+  or one of its nodes runs.
 - A group's row lists the nodes its own file declares and the groups it includes, a node's
   the groups whose files declare it, as `string[]`.
 - `Cell/Rant/Groups/Manage` and `Cell/Rant/Nodes/Manage` are tasks that take a

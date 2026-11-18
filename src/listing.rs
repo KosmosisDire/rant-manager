@@ -14,7 +14,7 @@ pub struct Group {
     pub nodes: Vec<String>,
     /// The groups it includes.
     pub groups: Vec<String>,
-    /// The mesh names of the running nodes it holds, its own runs' and those its blocks made.
+    /// The mesh names of the nodes its own runs hold, with those of the groups they include.
     pub copies: Vec<String>,
 }
 
@@ -66,8 +66,6 @@ struct CopyJson {
     name: String,
     #[serde(default, rename = "type")]
     node_type: String,
-    #[serde(default)]
-    group: String,
 }
 
 #[derive(Deserialize)]
@@ -92,8 +90,8 @@ pub fn parse(groups_json: &str, nodes_json: &str) -> Result<Listing, String> {
     let groups: Vec<GroupJson> = serde_json::from_str(groups_json).map_err(|e| format!("rant ls groups: {e}"))?;
     let nodes: NodesJson = serde_json::from_str(nodes_json).map_err(|e| format!("rant ls nodes: {e}"))?;
 
-    // a run shows "Nav speed=2" when the group runs twice, and an included group runs
-    // inside the run that includes it, named on each node its own blocks made
+    // only a group started itself runs, never one a run includes, and a run shows
+    // "Nav speed=2" when the group runs twice
     let mut by_group: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for run in &nodes.groups {
         let root = run.group.split(' ').next().unwrap_or_default();
@@ -102,9 +100,6 @@ pub fn parse(groups_json: &str, nodes_json: &str) -> Result<Listing, String> {
         }
     }
     let copies: Vec<&CopyJson> = nodes.groups.iter().flat_map(|r| &r.nodes).chain(&nodes.nodes).collect();
-    for c in copies.iter().filter(|c| !c.group.is_empty()) {
-        add(by_group.entry(&c.group).or_default(), &c.name);
-    }
 
     // a node two runs share shows under both
     let mut by_node: BTreeMap<String, Node> = BTreeMap::new();
@@ -144,7 +139,7 @@ mod tests {
     ]"#;
 
     #[test]
-    fn a_run_marks_its_group_and_the_groups_it_includes() {
+    fn a_run_marks_only_the_group_it_started() {
         let nodes = r#"{
             "domain": 151,
             "groups": [ { "group": "Top", "nodes": [
@@ -157,7 +152,7 @@ mod tests {
         let l = parse(GROUPS, nodes).unwrap();
         let held: Vec<(&str, Vec<String>)> = l.groups.iter().map(|g| (g.name.as_str(), g.copies.clone())).collect();
         let both = vec!["sleeper".to_string(), "other_waiter".to_string()];
-        assert_eq!(held, [("Top", both.clone()), ("io/Ft", both), ("io/Idle", vec![])]);
+        assert_eq!(held, [("Top", both), ("io/Ft", vec![]), ("io/Idle", vec![])]);
         assert_eq!(l.groups[1].description, "Two sleepers");
         assert_eq!(
             l.nodes,

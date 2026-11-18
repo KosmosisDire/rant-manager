@@ -36,6 +36,8 @@ NodeState      { name: string, status: RunningStatus, groups: string[] }
 - A group's `nodes` are the nodes its own file declares, and its `groups` the groups it
   includes. A node's `groups` are the groups whose own files declare it.
 - A group with a param that has no default lists no nodes.
+- A group is Running only while a run of it started with `rant run` holds a node. A group
+  that a running group includes, or that declares a running node, stays Stopped.
 
 ## Manage
 

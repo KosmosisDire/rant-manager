@@ -22,19 +22,21 @@ Every name starts with a prefix:
 ## Types
 
 ```
-RunningStatus  = enum<u8> { Stopped, Running }
+RunningStatus  = enum<u8> { Stopped, Running, Starting, Stopping }
 Action         = enum<u8> { Run, Stop, Restart }
 ProgressStatus = enum<u8> { Starting, Running, Stopped, Failed }
 ManageRequest  { name: string, action: Action }
 NodeProgress   { name: string, status: ProgressStatus, note: string }
 GroupState     { name: string, description: string, status: RunningStatus,
-                 nodes: string[], groups: string[] }
+                 running: string[], nodes: string[], groups: string[] }
 NodeState      { name: string, status: RunningStatus, groups: string[] }
 ```
 
 - `name` is what the CLI takes: `io/Ft` or `io/my_node`, or `Ft` outside every package.
 - A group's `nodes` are the nodes its own file declares, and its `groups` the groups it
   includes. A node's `groups` are the groups whose own files declare it.
+- A group's `running` holds the mesh names of the nodes its run holds that run, those of
+  the groups it includes too.
 - A group with a param that has no default lists no nodes.
 - A group is Running only while a run of it started with `rant run` holds a node. A group
   that a running group includes, or that declares a running node, stays Stopped.
@@ -52,4 +54,8 @@ NodeState      { name: string, status: RunningStatus, groups: string[] }
 - A failed call answers an error naming each failed node, or with the CLI's text.
 - A cancel is refused, since a CLI cut short could leave a node it started untracked.
 - The manager refuses to stop or restart a group or node that holds itself.
+- While a call runs, its group or node shows Starting for Run, Stopping for Stop, and for
+  Restart Stopping until its first node starts again, then Starting. A group's `running`
+  follows each node as it comes up or goes down. Runs and stops made elsewhere show only
+  Running and Stopped.
 - The lists show the outcome before the call answers. Changes made elsewhere show within 2 s.

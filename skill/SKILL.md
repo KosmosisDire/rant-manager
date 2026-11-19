@@ -17,7 +17,11 @@ HMI can see which run and run, stop or restart them.
 - Names start with the workspace's prefix, else its folder name in PascalCase (`cell` is
   `Cell`). `Cell/Rant/Groups` lists every group as `GroupState[]`, `Cell/Rant/Nodes` every
   node as `NodeState[]`, each row with its `name`, as the CLI takes it, and its `status`
-  (Stopped, Running).
+  (Stopped, Running, Starting, Stopping).
+- Starting and Stopping show while a Manage call runs, stops or restarts it. A restart shows
+  Stopping until its first node starts again. A group's `running` lists the mesh names of its
+  nodes that run, kept up to date as they come up and go down, so the list alone follows a
+  group without the task's progress.
 - A group is Running only while it was started itself, never because a group including it
   or one of its nodes runs.
 - A group's row lists the nodes its own file declares and the groups it includes, a node's

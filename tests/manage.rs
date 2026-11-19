@@ -3,10 +3,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rant::types::Empty;
-use rant::{CallOptions, Node, NodeOptions, RemoteTask, TaskOptions, VariableOptions};
+use rant::{CallOptions, Node, NodeOptions, RemoteTask, RemoteVariable, TaskOptions, VariableOptions};
 use rant_manager::{Action, GroupState, ManageRequest, NodeProgress, NodeState, ProgressStatus, RunningStatus};
 
 /// Set on every rant command the test runs, so the nodes those start inherit it.
@@ -132,6 +133,34 @@ fn statuses(update: &[NodeProgress]) -> Vec<(&str, ProgressStatus)> {
     update.iter().map(|n| (n.name.as_str(), n.status)).collect()
 }
 
+type Shown = Arc<Mutex<Vec<(RunningStatus, Vec<String>)>>>;
+
+/// Each status and running list the group's row shows from now on, a repeat left out.
+fn watch(groups: &RemoteVariable<Vec<GroupState>>, name: &'static str) -> Shown {
+    let shown = Shown::default();
+    let seen = Arc::clone(&shown);
+    groups
+        .on_change(move |u| {
+            let Some(g) = u.into_inner().into_iter().find(|g| g.name == name) else { return };
+            let mut seen = seen.lock().unwrap();
+            if seen.last().is_none_or(|(s, r)| (*s, r) != (g.status, &g.running)) {
+                seen.push((g.status, g.running));
+            }
+        })
+        .unwrap();
+    shown
+}
+
+/// The statuses shown since the last take, each once in order, and the last running list sorted.
+fn take(shown: &Shown) -> (Vec<RunningStatus>, Vec<String>) {
+    let all = std::mem::take(&mut *shown.lock().unwrap());
+    let mut statuses: Vec<RunningStatus> = all.iter().map(|(s, _)| *s).collect();
+    statuses.dedup();
+    let mut last = all.last().map(|(_, r)| r.clone()).unwrap_or_default();
+    last.sort();
+    (statuses, last)
+}
+
 #[test]
 fn manage_runs_stops_and_restarts_groups_and_nodes() {
     let ws = Workspace::new("manage", 180);
@@ -148,7 +177,7 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
 
     let ft = group("io/Ft");
     assert_eq!(ft.description, "Two sleepers");
-    assert_eq!(ft.status, RunningStatus::Stopped);
+    assert_eq!((ft.status, ft.running), (RunningStatus::Stopped, vec![]));
     assert_eq!((ft.nodes, ft.groups), (vec!["io/sleeper".to_string(), "io/napper".to_string()], vec![]));
     let line = group("Line");
     assert_eq!((line.nodes, line.groups), (vec![], vec!["io/Ft".to_string()]));
@@ -159,6 +188,7 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
 
     use ProgressStatus::{Running, Starting, Stopped};
     let groups_manage = manage(&node, "Cell/Rant/Groups/Manage");
+    let ft_shown = watch(&groups, "io/Ft");
     let updates = call(&groups_manage, "io/Ft", Action::Run).unwrap();
     let shown: Vec<_> = updates.iter().map(|u| statuses(u)).collect();
     assert_eq!(
@@ -174,6 +204,11 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
     assert_eq!(updates[3][0].note, "started");
     wait_for("io/Ft running", || group_is(RunningStatus::Running) && sleeper_is(RunningStatus::Running));
     assert_eq!(ws.running(), ["manager", "napper", "sleeper"]);
+    let starting = (RunningStatus::Starting, vec!["sleeper".to_string()]);
+    assert!(ft_shown.lock().unwrap().contains(&starting), "the row lists each node as it comes up");
+    let both = vec!["napper".to_string(), "sleeper".to_string()];
+    use RunningStatus as Group;
+    assert_eq!(take(&ft_shown), (vec![Group::Stopped, Group::Starting, Group::Running], both.clone()));
 
     let nodes_manage = manage(&node, "Cell/Rant/Nodes/Manage");
     let updates = call(&nodes_manage, "io/sleeper", Action::Restart).unwrap();
@@ -189,8 +224,16 @@ fn manage_runs_stops_and_restarts_groups_and_nodes() {
     assert!(group_is(RunningStatus::Running), "io/Ft still holds napper");
     assert_eq!(ws.running(), ["manager", "napper"]);
 
+    wait_for("io/Ft without sleeper", || group("io/Ft").running == ["napper"]);
+    take(&ft_shown);
+    call(&groups_manage, "io/Ft", Action::Restart).unwrap();
+    wait_for("io/Ft restarted", || group_is(RunningStatus::Running) && group("io/Ft").running.len() == 2);
+    assert_eq!(take(&ft_shown), (vec![Group::Stopping, Group::Starting, Group::Running], both));
+    assert_eq!(ws.running(), ["manager", "napper", "sleeper"]);
+
     call(&groups_manage, "io/Ft", Action::Stop).unwrap();
     wait_for("io/Ft stopped", || group_is(RunningStatus::Stopped));
+    assert_eq!(take(&ft_shown), (vec![Group::Stopping, Group::Stopped], vec![]));
     let again = call(&groups_manage, "io/Ft", Action::Stop).unwrap_err();
     assert!(again.contains("not running"), "{again}");
 

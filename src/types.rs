@@ -5,6 +5,10 @@
 pub enum RunningStatus {
     Stopped,
     Running,
+    /// While a Manage call runs it or restarts it.
+    Starting,
+    /// While a Manage call stops it, or restarts it until its first node starts again.
+    Stopping,
 }
 
 /// What a Manage task is asked to do.
@@ -48,6 +52,8 @@ pub struct GroupState {
     pub name: String,
     pub description: String,
     pub status: RunningStatus,
+    /// The mesh names of the nodes its run holds that run, with those of the groups it includes.
+    pub running: Vec<String>,
     /// The nodes its own file declares.
     pub nodes: Vec<String>,
     /// The groups it includes.

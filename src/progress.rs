@@ -30,8 +30,8 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// Takes one printed row, in place of the earlier one of its node.
-    pub fn take(&mut self, line: &str) -> Result<(), String> {
+    /// Takes one printed row, in place of the earlier one of its node, and gives it back.
+    pub fn take(&mut self, line: &str) -> Result<NodeProgress, String> {
         let row: RowJson = serde_json::from_str(line).map_err(|e| format!("a row the CLI printed did not parse: {e}: {line}"))?;
         let status = match row.state {
             StateJson::Starting => ProgressStatus::Starting,
@@ -42,10 +42,10 @@ impl Progress {
         let note = if row.detail.is_empty() { row.status } else { format!("{} ({})", row.status, row.detail) };
         let node = NodeProgress { name: row.name, status, note };
         match self.nodes.iter_mut().find(|n| n.name == node.name) {
-            Some(old) => *old = node,
-            None => self.nodes.push(node),
+            Some(old) => *old = node.clone(),
+            None => self.nodes.push(node.clone()),
         }
-        Ok(())
+        Ok(node)
     }
 
     /// Each failed node and what the CLI says of it, or none when none failed.

@@ -12,7 +12,7 @@ use crate::cli::Cli;
 use crate::listing::{self, Listing};
 use crate::names;
 use crate::progress::Progress;
-use crate::types::{Action, GroupState, ManageRequest, NodeProgress, NodeState, RunningStatus};
+use crate::types::{Action, GroupState, ManageRequest, NodeProgress, NodeState, ProgressStatus, RunningStatus};
 
 /// How often the CLI is asked what runs, so changes made elsewhere show.
 const POLL: Duration = Duration::from_secs(2);
@@ -50,18 +50,58 @@ fn status(running: bool) -> RunningStatus {
     if running { RunningStatus::Running } else { RunningStatus::Stopped }
 }
 
-fn group_state(g: &listing::Group) -> GroupState {
+/// A Manage call under way, which its row shows ahead of the CLI's listing.
+struct Busy {
+    kind: Kind,
+    name: String,
+    action: Action,
+    status: RunningStatus,
+    /// The mesh names of its nodes that run, as the call's rows say.
+    running: Vec<String>,
+}
+
+impl Busy {
+    fn new(kind: Kind, name: &str, action: Action, copies: &[String]) -> Busy {
+        let status = match action {
+            Action::Stop => RunningStatus::Stopping,
+            Action::Restart if !copies.is_empty() => RunningStatus::Stopping,
+            _ => RunningStatus::Starting,
+        };
+        Busy { kind, name: name.to_string(), action, status, running: copies.to_vec() }
+    }
+
+    /// Takes one of the call's rows: a node runs while its newest row says so.
+    fn follow(&mut self, row: &NodeProgress) {
+        // a restart halts every node before it prints the first row of its start
+        if self.action == Action::Restart && self.status == RunningStatus::Stopping && matches!(row.status, ProgressStatus::Starting | ProgressStatus::Running) {
+            self.status = RunningStatus::Starting;
+            self.running.clear();
+        }
+        self.running.retain(|n| *n != row.name);
+        if row.status == ProgressStatus::Running {
+            self.running.push(row.name.clone());
+        }
+    }
+
+    fn of<'a>(busy: Option<&'a Busy>, kind: Kind, name: &str) -> Option<&'a Busy> {
+        busy.filter(|b| b.kind == kind && b.name == name)
+    }
+}
+
+fn group_state(g: &listing::Group, busy: Option<&Busy>) -> GroupState {
     GroupState {
         name: g.name.clone(),
         description: g.description.clone(),
-        status: status(!g.copies.is_empty()),
+        status: busy.map_or_else(|| status(!g.copies.is_empty()), |b| b.status),
+        running: busy.map_or_else(|| g.copies.clone(), |b| b.running.clone()),
         nodes: g.nodes.clone(),
         groups: g.groups.clone(),
     }
 }
 
-fn node_state(n: &listing::Node) -> NodeState {
-    NodeState { name: n.name.clone(), status: status(!n.copies.is_empty()), groups: n.groups.clone() }
+fn node_state(n: &listing::Node, busy: Option<&Busy>) -> NodeState {
+    let status = busy.map_or_else(|| status(!n.copies.is_empty()), |b| b.status);
+    NodeState { name: n.name.clone(), status, groups: n.groups.clone() }
 }
 
 /// A list variable, set only when its rows change.
@@ -81,6 +121,19 @@ impl<T: rant::Message + PartialEq> List<T> {
             let _ = self.var.set(&rows);
             self.shown = rows;
         }
+    }
+}
+
+struct Lists {
+    groups: List<GroupState>,
+    nodes: List<NodeState>,
+}
+
+impl Lists {
+    /// Brings both lists in line with the listing, with the row of a call under way as it says.
+    fn show(&mut self, listing: &Listing, busy: Option<&Busy>) {
+        self.groups.show(listing.groups.iter().map(|g| group_state(g, Busy::of(busy, Kind::Group, &g.name))).collect());
+        self.nodes.show(listing.nodes.iter().map(|n| node_state(n, Busy::of(busy, Kind::Node, &n.name))).collect());
     }
 }
 
@@ -106,8 +159,7 @@ pub struct Manager {
     listing: Listing,
     /// Why the CLI last failed to list, so a lasting failure is logged once.
     failure: Option<String>,
-    groups: List<GroupState>,
-    nodes: List<NodeState>,
+    lists: Lists,
     _manage: [Manage; 2],
 }
 
@@ -128,8 +180,7 @@ impl Manager {
         let node = Node::new("manager", opts)?;
         let (events, inbox) = mpsc::channel();
         Ok(Manager {
-            groups: List::new(&node, "Rant/Groups")?,
-            nodes: List::new(&node, "Rant/Nodes")?,
+            lists: Lists { groups: List::new(&node, "Rant/Groups")?, nodes: List::new(&node, "Rant/Nodes")? },
             _manage: [manage_task(&node, "Rant/Groups/Manage", Kind::Group, &events)?, manage_task(&node, "Rant/Nodes/Manage", Kind::Node, &events)?],
             node,
             cli: Cli { exe: o.rant, workspace: o.workspace },
@@ -181,7 +232,7 @@ impl Manager {
         }
     }
 
-    fn manage(&self, kind: Kind, name: &str, action: Action, task: &Pending) -> Result<(), String> {
+    fn manage(&mut self, kind: Kind, name: &str, action: Action, task: &Pending) -> Result<(), String> {
         let copies = match kind {
             Kind::Group => self.listing.groups.iter().find(|g| g.name == name).map(|g| &g.copies),
             Kind::Node => self.listing.nodes.iter().find(|n| n.name == name).map(|n| &n.copies),
@@ -193,12 +244,18 @@ impl Manager {
         if action != Action::Run && copies.contains(&self.me) {
             return Err(format!("the manager cannot stop or restart `{name}`, which holds the manager itself"));
         }
-        // each node's row goes to the caller as the CLI prints it, and a failed node says why
+        let (lists, listing, cli) = (&mut self.lists, &self.listing, &self.cli);
+        let mut busy = Busy::new(kind, name, action, copies);
+        lists.show(listing, Some(&busy));
+        // each node's row goes to the caller and to the lists as the CLI prints it, and a
+        // failed node says why
         let mut progress = Progress::default();
         let mut rant = |args: &[&str]| {
             let args = [args, &["-y", "--json", "--lines"][..]].concat();
-            let done = self.cli.stream(&args, |line| match progress.take(line) {
-                Ok(()) => {
+            let done = cli.stream(&args, |line| match progress.take(line) {
+                Ok(row) => {
+                    busy.follow(&row);
+                    lists.show(listing, Some(&busy));
                     let _ = task.progress(&progress.nodes);
                 }
                 Err(why) => eprintln!("{why}"),
@@ -243,10 +300,51 @@ impl Manager {
                     let _ = self.node.set_status("cli", Level::Error, &why, StatusOptions::new());
                     self.failure = Some(why);
                 }
-                return;
             }
         }
-        self.groups.show(self.listing.groups.iter().map(group_state).collect());
-        self.nodes.show(self.listing.nodes.iter().map(node_state).collect());
+        // a failed read still ends the row of the call just done
+        self.lists.show(&self.listing, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, status: ProgressStatus) -> NodeProgress {
+        NodeProgress { name: name.into(), status, note: String::new() }
+    }
+
+    #[test]
+    fn a_run_lists_each_node_once_it_runs() {
+        let mut b = Busy::new(Kind::Group, "io/Ft", Action::Run, &[]);
+        assert_eq!(b.status, RunningStatus::Starting);
+        b.follow(&row("sleeper", ProgressStatus::Starting));
+        b.follow(&row("napper", ProgressStatus::Starting));
+        b.follow(&row("sleeper", ProgressStatus::Running));
+        assert_eq!((b.status, b.running.clone()), (RunningStatus::Starting, vec!["sleeper".to_string()]));
+        b.follow(&row("napper", ProgressStatus::Failed));
+        assert_eq!(b.running, ["sleeper"]);
+    }
+
+    #[test]
+    fn a_restart_stops_until_its_first_node_starts() {
+        let copies = ["sleeper".to_string(), "napper".to_string()];
+        let mut b = Busy::new(Kind::Group, "io/Ft", Action::Restart, &copies);
+        assert_eq!((b.status, b.running.len()), (RunningStatus::Stopping, 2));
+        b.follow(&row("gone", ProgressStatus::Stopped));
+        assert_eq!(b.status, RunningStatus::Stopping);
+        b.follow(&row("sleeper", ProgressStatus::Starting));
+        assert_eq!((b.status, b.running.len()), (RunningStatus::Starting, 0));
+        assert_eq!(Busy::new(Kind::Group, "io/Ft", Action::Restart, &[]).status, RunningStatus::Starting);
+    }
+
+    #[test]
+    fn a_stop_keeps_stopping_while_a_shared_node_stays_up() {
+        let copies = ["sleeper".to_string(), "napper".to_string()];
+        let mut b = Busy::new(Kind::Group, "io/Ft", Action::Stop, &copies);
+        b.follow(&row("napper", ProgressStatus::Stopped));
+        b.follow(&row("sleeper", ProgressStatus::Running));
+        assert_eq!((b.status, b.running.clone()), (RunningStatus::Stopping, vec!["sleeper".to_string()]));
     }
 }

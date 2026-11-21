@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use rant::types::Empty;
-use rant::{Level, Node, NodeOptions, PendingTask, StatusOptions, TaskDefinition, TaskOptions, TaskRequest, VariableDefinition, VariableOptions};
+use rant::{DiagnosticLevel, Node, NodeOptions, PendingTask, StatusOptions, TaskDefinition, TaskOptions, TaskRequest, VariableDefinition, VariableOptions};
 
 use crate::cli::Cli;
 use crate::listing::{self, Listing};
@@ -297,7 +297,7 @@ impl Manager {
             Err(why) => {
                 if self.failure.as_ref() != Some(&why) {
                     eprintln!("{why}");
-                    let _ = self.node.set_status("cli", Level::Error, &why, StatusOptions::new());
+                    let _ = self.node.set_status("cli", DiagnosticLevel::Error, &why, StatusOptions::new());
                     self.failure = Some(why);
                 }
             }
